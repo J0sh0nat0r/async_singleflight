@@ -21,7 +21,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let g = Arc::new(Group::new());
+//!     let g = Arc::new(Group::<String, _>::new());
 //!     let mut handlers = Vec::new();
 //!     for _ in 0..10 {
 //!         let g = g.clone();
@@ -36,33 +36,28 @@
 //! }
 //! ```
 //!
+use std::{borrow::Borrow, collections::HashMap, future::Future, hash::Hash, sync::Arc};
 
-use std::future::Future;
-use std::sync::Arc;
-
-use anyhow::Result;
-use hashbrown::HashMap;
+use once_cell::sync::OnceCell;
 use tokio::sync::{Mutex, Notify};
 
 // Call is an in-flight or completed call to work.
-#[derive(Clone)]
 struct Call<T>
-where
-    T: Clone,
+    where
+        T: Clone,
 {
-    nt: Arc<Notify>,
-    // TODO: how to share res through threads without lock?
-    res: Arc<parking_lot::RwLock<Option<T>>>,
+    notify: Notify,
+    res: OnceCell<T>,
 }
 
 impl<T> Call<T>
-where
-    T: Clone,
+    where
+        T: Clone,
 {
     fn new() -> Call<T> {
         Call {
-            nt: Arc::new(Notify::new()),
-            res: Arc::new(parking_lot::RwLock::new(None)),
+            notify: Notify::new(),
+            res: OnceCell::new(),
         }
     }
 }
@@ -70,21 +65,23 @@ where
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Default)]
-pub struct Group<T>
-where
-    T: Clone,
+pub struct Group<K, V>
+    where
+        K: ToOwned + Eq + Hash,
+        V: Clone,
 {
-    m: Mutex<HashMap<String, Arc<Call<T>>>>,
+    calls: Mutex<HashMap<K, Arc<Call<V>>>>,
 }
 
-impl<T> Group<T>
-where
-    T: Clone,
+impl<K, V> Group<K, V>
+    where
+        K: ToOwned + Eq + Hash,
+        V: Clone,
 {
     /// Create a new Group to do work with.
-    pub fn new() -> Group<T> {
-        Group {
-            m: Mutex::new(HashMap::new()),
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(HashMap::new()),
         }
     }
 
@@ -93,65 +90,78 @@ where
     /// wait until the original call completes and return the same value.
     /// Only owner call returns error if exists.
     /// The third return value indicates whether the call is the owner.
-    pub async fn work(
+    pub async fn work<Q, E>(
         &self,
-        key: &str,
-        fut: impl Future<Output = Result<T>>,
-    ) -> (Option<T>, Option<anyhow::Error>, bool) {
+        key: &Q,
+        fut: impl Future<Output=Result<V, E>>,
+    ) -> (Option<V>, Option<E>, bool)
+        where
+            K: Borrow<Q>,
+            Q: ?Sized + Eq + Hash + ToOwned<Owned=K>
+    {
         // grab lock
-        let mut m = self.m.lock().await;
+        let mut calls = self.calls.lock().await;
 
         // key already exists
-        if let Some(c) = m.get(key) {
-            let c = c.clone();
-            // need to create Notify first before drop lock
-            let nt = c.nt.notified();
-            drop(m);
+        if let Some(call) = calls.get(key) {
+            // need to create Notify first before dropping the lock
+            let call = call.clone();
+            let notify = call.notify.notified();
+
+            drop(calls);
+
             // wait for notify
-            nt.await;
-            let res = c.res.read();
-            return (res.clone(), None, false);
+            notify.await;
+
+            return (call.res.get().cloned(), None, false);
         }
 
         // insert call into map and start call
-        let c = Arc::new(Call::new());
-        m.insert(key.to_owned(), c);
-        drop(m);
+        let call = Arc::new(Call::new());
+
+        calls.insert(key.to_owned(), call.clone());
+
+        drop(calls);
+
         let res = fut.await;
 
-        // grab lock before set result and notify waiters
-        let mut m = self.m.lock().await;
-        let c = m.get(key).unwrap();
-        if res.is_ok() {
-            let mut m2 = c.res.write();
-            *m2 = Some(res.as_ref().unwrap().clone());
-            drop(m2);
+        if let Ok(ref value) = res {
+            debug_assert!(call.res.set(value.clone()).is_ok())
         }
-        c.nt.notify_waiters();
-        m.remove(key).unwrap();
-        drop(m);
 
-        if res.is_ok() {
-            return (Some(res.unwrap()), None, true);
+        // grab lock before set notifying waiters
+        let mut calls = self.calls.lock().await;
+
+        call.notify.notify_waiters();
+
+        calls.remove(key).unwrap();
+
+        drop(calls);
+
+        match res {
+            Err(err) => (None, Some(err), true),
+            Ok(val) => (Some(val), None, true)
         }
-        (None, Some(res.err().unwrap()), true)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Group;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use anyhow::Result;
+
+    use super::Group;
 
     const RES: usize = 7;
 
     async fn return_res() -> Result<usize> {
-        Ok(7)
+        Ok(RES)
     }
 
     #[tokio::test]
     async fn test_simple() {
-        let g = Group::new();
+        let g = Group::<String, _>::new();
         let res = g.work("key", return_res()).await.0;
         let r = res.unwrap();
         assert_eq!(r, RES);
@@ -163,22 +173,29 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        async fn expensive_fn() -> Result<usize> {
+        async fn expensive_fn(cnt: Arc<AtomicUsize>) -> Result<usize> {
+            cnt.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::new(1, 500)).await;
             Ok(RES)
         }
 
-        let g = Arc::new(Group::new());
+        let g = Arc::new(Group::<String, _>::new());
+        let cnt = Arc::new(AtomicUsize::new(0));
+
         let mut handlers = Vec::new();
         for _ in 0..10 {
             let g = g.clone();
+            let cnt = cnt.clone();
+
             handlers.push(tokio::spawn(async move {
-                let res = g.work("key", expensive_fn()).await.0;
+                let res = g.work("key", expensive_fn(cnt)).await.0;
                 let r = res.unwrap();
-                println!("{}", r);
+                assert_eq!(r, RES);
             }));
         }
 
         join_all(handlers).await;
+
+        assert_eq!(1, cnt.load(Ordering::SeqCst));
     }
 }
