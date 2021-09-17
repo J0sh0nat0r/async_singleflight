@@ -43,16 +43,16 @@ use tokio::sync::{Mutex, Notify};
 
 // Call is an in-flight or completed call to work.
 struct Call<T>
-    where
-        T: Clone,
+where
+    T: Clone,
 {
     notify: Notify,
     res: OnceCell<T>,
 }
 
 impl<T> Call<T>
-    where
-        T: Clone,
+where
+    T: Clone,
 {
     fn new() -> Call<T> {
         Call {
@@ -66,17 +66,17 @@ impl<T> Call<T>
 /// can be executed with duplicate suppression.
 #[derive(Default)]
 pub struct Group<K, V>
-    where
-        K: ToOwned + Eq + Hash,
-        V: Clone,
+where
+    K: Eq + Hash + ToOwned,
+    V: Clone,
 {
     calls: Mutex<HashMap<K, Arc<Call<V>>>>,
 }
 
 impl<K, V> Group<K, V>
-    where
-        K: ToOwned + Eq + Hash,
-        V: Clone,
+where
+    K: Eq + Hash + ToOwned,
+    V: Clone,
 {
     /// Create a new Group to do work with.
     pub fn new() -> Self {
@@ -93,11 +93,11 @@ impl<K, V> Group<K, V>
     pub async fn work<Q, E>(
         &self,
         key: &Q,
-        fut: impl Future<Output=Result<V, E>>,
+        fut: impl Future<Output = Result<V, E>>,
     ) -> (Option<V>, Option<E>, bool)
-        where
-            K: Borrow<Q>,
-            Q: ?Sized + Eq + Hash + ToOwned<Owned=K>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Eq + Hash + ToOwned<Owned = K>,
     {
         // grab lock
         let mut calls = self.calls.lock().await;
@@ -140,7 +140,7 @@ impl<K, V> Group<K, V>
 
         match res {
             Err(err) => (None, Some(err), true),
-            Ok(val) => (Some(val), None, true)
+            Ok(val) => (Some(val), None, true),
         }
     }
 }
