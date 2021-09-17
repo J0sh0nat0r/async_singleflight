@@ -118,25 +118,21 @@ where
 
         // insert call into map and start call
         let call = Arc::new(Call::new());
-
         calls.insert(key.to_owned(), call.clone());
-
         drop(calls);
 
         let res = fut.await;
 
         if let Ok(ref value) = res {
-            debug_assert!(call.res.set(value.clone()).is_ok())
+            call.res.set(value.clone()).ok().expect("result is not already set")
         }
 
         // grab lock before set notifying waiters
         let mut calls = self.calls.lock().await;
+        calls.remove(key).unwrap();
+        drop(calls);
 
         call.notify.notify_waiters();
-
-        calls.remove(key).unwrap();
-
-        drop(calls);
 
         match res {
             Err(err) => (None, Some(err), true),
